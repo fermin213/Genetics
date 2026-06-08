@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, redirect, url_for, flash
 import pandas as pd
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import OperationalError
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user, UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
@@ -10,6 +11,10 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://animalesdb_user:z1xIETnjgzHv4GZXEDNQlRC9Cq0tDJfX@dpg-d29unpndiees738f42u0-a.oregon-postgres.render.com/animalesdb_6g2y'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'secreto_muy_fuerte'
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+}
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
@@ -421,30 +426,53 @@ def actualizar_epds_excel(raza_id):
         return redirect(url_for('ver_raza', raza_id=raza_id))
 
     actualizados, no_encontrados = 0, []
+
     def clean_rp(val):
         if pd.isnull(val): return ''
         if isinstance(val, (int, float)): return str(int(val))
         return str(val).strip()
 
-    for index, row in df.iterrows():
-        rp = clean_rp(row.get('RP'))
-        if not rp: continue
-        animal = Animal.query.filter_by(rp=rp, raza_id=raza.id).first()
-        if animal:
-            for excel_col, db_field in COLUMN_MAP.items():
-                if excel_col in row and not pd.isnull(row[excel_col]):
-                    setattr(animal, db_field, str(row[excel_col]))
-            
-            db.session.add(animal)
-            actualizados += 1
-        else:
-            no_encontrados.append(rp)
+    def commit_batch():
+        try:
+            db.session.commit()
+        except OperationalError:
+            db.session.rollback()
+            db.session.remove()
+            db.session.commit()
 
-    db.session.commit()
+    try:
+        for _, row in df.iterrows():
+            rp = clean_rp(row.get('RP'))
+            if not rp: continue
+
+            try:
+                animal = Animal.query.filter_by(rp=rp, raza_id=raza.id).first()
+            except OperationalError:
+                db.session.rollback()
+                db.session.remove()
+                animal = Animal.query.filter_by(rp=rp, raza_id=raza.id).first()
+
+            if animal:
+                for excel_col, db_field in COLUMN_MAP.items():
+                    if excel_col in row and not pd.isnull(row[excel_col]):
+                        setattr(animal, db_field, str(row[excel_col]))
+                db.session.add(animal)
+                actualizados += 1
+                if actualizados % 50 == 0:
+                    commit_batch()
+            else:
+                no_encontrados.append(rp)
+
+        commit_batch()
+    except OperationalError as e:
+        db.session.rollback()
+        flash(f'Error de conexión a la base de datos: {e}', 'danger')
+        return redirect(url_for('ver_raza', raza_id=raza_id))
+
     flash(f'Proceso completado. Se actualizaron {actualizados} animales.', 'success')
     if no_encontrados:
         flash(f'ADVERTENCIA: No se encontraron los siguientes RPs: {", ".join(no_encontrados)}', 'warning')
-    
+
     return redirect(url_for('ver_raza', raza_id=raza_id))
 
 if __name__ == '__main__':
